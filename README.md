@@ -4,6 +4,10 @@ Small, light utilities for Linux desktops, one folder each. They sit beside
 [xfce-macos](https://github.com/antoniocosta/xfce-macos), which makes Xfce feel like macOS, and work
 on their own too.
 
+If you like this or find it useful, support the project by buying me a coffee.
+
+<a href="https://www.buymeacoffee.com/antoniocosta" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 40px !important;width: 140px !important;" ></a>
+
 | Utility | What it does |
 |---|---|
 | [net-badge](#net-badge) | Network latency in the menu bar ("● 24 ms"), with a popover. Xfce panel. |
