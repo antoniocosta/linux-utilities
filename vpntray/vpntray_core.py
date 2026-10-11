@@ -11,6 +11,28 @@ from dataclasses import dataclass, field
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
+class LinkWatch:
+    """Tells when a network interface or address changes: the VPN's tun0 appearing or going, Wi-Fi coming and
+    going. `ip monitor` sleeps until the kernel reports a change, so nothing is polled."""
+    def __init__(self, cmd=("ip", "monitor", "link", "address")):
+        self.proc = subprocess.Popen(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+    def fileno(self):
+        return self.proc.stdout.fileno()
+
+    def read(self):
+        """The lines that have arrived, or None once the monitor has ended."""
+        data = os.read(self.fileno(), 65536)
+        return data.decode("utf-8", "replace").splitlines() if data else None
+
+    def close(self):
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
 def strip_ansi(text):
     return ANSI_RE.sub("", text or "")
 

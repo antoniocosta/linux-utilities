@@ -133,5 +133,32 @@ class Adapter(unittest.TestCase):
         self.assertIn("SUDO_ASKPASS=/x/askpass", v.run([]).out)
 
 
+class TestLinkWatch(unittest.TestCase):
+    def test_lines_arrive_as_they_happen(self):
+        import select
+        w = core.LinkWatch(("sh", "-c", "echo '5: tun0: <UP>'; sleep 0.3; echo '5: tun0: <DOWN>'; sleep 0.3"))
+        got = []
+        for _ in range(10):
+            ready, _, _ = select.select([w.fileno()], [], [], 2)
+            if not ready:
+                break
+            lines = w.read()
+            if lines is None:
+                break
+            got += lines
+        w.close()
+        self.assertEqual(got, ["5: tun0: <UP>", "5: tun0: <DOWN>"])
+
+    def test_ends_with_none(self):
+        w = core.LinkWatch(("true",))
+        w.proc.wait()
+        self.assertIsNone(w.read())
+        w.close()
+
+    def test_missing_command(self):
+        with self.assertRaises(OSError):
+            core.LinkWatch(("/nonexistent/ip-monitor",))
+
+
 if __name__ == "__main__":
     unittest.main()

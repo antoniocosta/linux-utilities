@@ -11,7 +11,7 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
-from vpntray_core import AdGuard  # noqa: E402
+from vpntray_core import AdGuard, LinkWatch  # noqa: E402
 
 import gi  # noqa: E402
 
@@ -54,6 +54,8 @@ class App(Gtk.Application):
         self.shown_at = 0.0
         self.win = None
         self.indicator = None
+        self.link = None
+        self.link_timer = 0
 
     # ---- lifecycle ------------------------------------------------------------------
     def do_command_line(self, cmdline):
@@ -63,9 +65,37 @@ class App(Gtk.Application):
             self.build_indicator()
             self.build_window()
             self.refresh(status_only=True)
+            self.watch_network()
         if "--background" not in args:
             self.show_panel()
         return 0
+
+    # ---- the VPN changing without us -------------------------------------------------
+    def watch_network(self):
+        """The icon must show the real state, also when the VPN was connected or dropped by something else
+        (the command line, a reconnect). The kernel tells us when an interface changes; nothing is polled."""
+        try:
+            self.link = LinkWatch()
+        except OSError:
+            self.link = None
+            return
+        GLib.io_add_watch(self.link.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, self.on_link)
+
+    def on_link(self, _fd, _cond):
+        if self.link.read() is None:                       # the monitor ended: start it again in a while
+            self.link.close()
+            self.link = None
+            GLib.timeout_add_seconds(10, lambda: (self.watch_network(), False)[1])
+            return False
+        if not self.link_timer:                            # several events arrive together: look once
+            self.link_timer = GLib.timeout_add(1000, self.link_changed)
+        return True
+
+    def link_changed(self):
+        self.link_timer = 0
+        if not self.busy:
+            self.refresh(status_only=True)
+        return False
 
     # ---- tray -----------------------------------------------------------------------
     def build_indicator(self):
