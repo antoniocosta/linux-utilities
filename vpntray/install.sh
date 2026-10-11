@@ -9,6 +9,7 @@ command -v adguardvpn-cli >/dev/null || warn "adguardvpn-cli not found yet: inst
 install_bin "$HERE/vpntray" "$HERE/vpntray_core.py" "$HERE/vpntray-askpass"
 mkd "$BIN/icons" "$HOME/.local/share/icons/hicolor/scalable/status"
 for f in "$HERE"/icons/*.svg; do track_file "$BIN/icons/$(basename "$f")"; track_file "$HOME/.local/share/icons/hicolor/scalable/status/$(basename "$f")"; done
+rm -f "$BIN"/icons/vpntray-{on,off}-symbolic.svg "$HOME"/.local/share/icons/hicolor/scalable/status/vpntray-{on,off}-symbolic.svg   # the earlier grey icons
 install -m 644 "$HERE"/icons/*.svg "$BIN/icons/"
 install -m 644 "$HERE"/icons/*.svg "$HOME/.local/share/icons/hicolor/scalable/status/"
 autostart_entry "vpntray" "$BIN/vpntray --background"

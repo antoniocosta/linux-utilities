@@ -102,7 +102,7 @@ class App(Gtk.Application):
         icons = os.path.join(HERE, "icons")
         icon_dir = icons if os.path.isdir(icons) else ""
         self.indicator = AppIndicator.Indicator.new_with_path(
-            "vpntray", "vpntray-off-symbolic", AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+            "vpntray", "vpntray-off", AppIndicator.IndicatorCategory.APPLICATION_STATUS,
             icon_dir)
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         menu = Gtk.Menu()
@@ -122,7 +122,7 @@ class App(Gtk.Application):
 
     def update_tray(self):
         on = bool(self.status and self.status.connected)
-        self.indicator.set_icon_full("vpntray-on-symbolic" if on else "vpntray-off-symbolic",
+        self.indicator.set_icon_full("vpntray-on" if on else "vpntray-off",
                                      f"{self.vpn.name} on" if on else f"{self.vpn.name} off")
         self.mi_state.set_label(f"{self.vpn.name}: connected" + (f" ({self.status.location})" if self.status.location else "")
                                 if on else f"{self.vpn.name}: disconnected")

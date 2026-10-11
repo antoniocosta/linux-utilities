@@ -50,7 +50,8 @@ Errors show inline; the panel hides when it loses focus. Click the shield and ch
 
 It drives the AdGuard VPN command-line tool (`adguardvpn-cli`, installed separately) and is
 **unofficial and not affiliated with AdGuard**. Python 3 + GTK3, about 30 MB, 0% CPU when idle:
-no timers; the status is read at start, when the panel opens, after each action, and whenever the
+no timers; the top-bar shield is AdGuard green with a check when connected and a dimmed outline when
+not; the status is read at start, when the panel opens, after each action, and whenever the
 network changes (it listens to `ip monitor`, so the shield also follows a VPN connected or dropped from
 the command line or by a reconnect). Your
 password goes only to the tool's standard input; nothing is stored. Connecting in TUN mode needs
