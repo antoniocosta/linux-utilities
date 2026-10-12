@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""vpntray: a light top-bar panel for a VPN command-line tool (unofficial; not affiliated with AdGuard).
+"""vpntray: a light top-bar menu and panel for a VPN command-line tool (unofficial; not affiliated with AdGuard).
 
-Event-driven: no timers while idle. The status is read at start, when the panel opens and after
-each action (with a few quick re-checks only while a connect/disconnect is settling).
+The menu (click the mask in the top bar) is laid out like the macOS app's:
+    Status / Location, Connect / Disconnect, Connect to >, Open / Exclusions / Stats / Support / Settings, Quit.
+The panel has the same tabs: Home, Exclusions, Stats, Support, Settings.
+
+Event-driven: no timers while idle. The status is read at start, when the panel opens, after each action and
+whenever the network changes (the kernel says so through `ip monitor`); the Stats tab refreshes every 2 seconds
+only while it is on screen.
 """
 import os
 import sys
@@ -11,6 +16,7 @@ import time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
+import vpntray_core as core  # noqa: E402
 from vpntray_core import AdGuard, LinkWatch  # noqa: E402
 
 import gi  # noqa: E402
@@ -22,11 +28,16 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
 
 APP_ID = "org.vpntray.Tray"
-WIDTH = 340
+WIDTH = 400
+TABS = ("home", "exclusions", "stats", "support", "settings")
+TAB_TITLES = {"home": "Home", "exclusions": "Exclusions", "stats": "Stats", "support": "Support", "settings": "Settings"}
+MENU_LOCATIONS = 12                         # how many of the fastest locations the "Connect to" menu lists
+SUPPORT_URL = "https://adguard-vpn.com/support/"
 CSS = b"""
 .vt-status { font-size: 15px; font-weight: bold; }
 .vt-dim { opacity: 0.65; font-size: 11px; }
 .vt-error { color: #e5484d; font-size: 11px; }
+.vt-head { font-weight: bold; }
 """
 
 
@@ -41,6 +52,20 @@ def bg(fn, done):
     threading.Thread(target=work, daemon=True).start()
 
 
+def dim(text, wrap=True):
+    lbl = Gtk.Label(label=text, xalign=0)
+    lbl.get_style_context().add_class("vt-dim")
+    lbl.set_line_wrap(wrap)
+    lbl.set_max_width_chars(46)
+    return lbl
+
+
+def page_box():
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    box.set_border_width(10)
+    return box
+
+
 class App(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
@@ -50,12 +75,19 @@ class App(Gtk.Application):
         self.account = None
         self.locations = []
         self.loc_time = 0.0
+        self.config = None
+        self.excl_mode, self.excl_items = "general", []
+        self.state = core.load_state()           # {"last": "Country, City"}: where it connected last
+        self.connected_at = None                 # when we saw it connect (if the service's start time is unknown)
         self.busy = False
         self.shown_at = 0.0
         self.win = None
         self.indicator = None
         self.link = None
         self.link_timer = 0
+        self.stats_timer = 0
+        self.on_stats = False                    # the Stats tab is the one showing
+        self.loading = False                     # filling widgets from the tool: ignore their change signals
 
     # ---- lifecycle ------------------------------------------------------------------
     def do_command_line(self, cmdline):
@@ -64,10 +96,11 @@ class App(Gtk.Application):
             self.hold()
             self.build_indicator()
             self.build_window()
-            self.refresh(status_only=True)
+            self.refresh()
             self.watch_network()
+        tab = next((a.split("=", 1)[1] for a in args if a.startswith("--tab=")), "home")
         if "--background" not in args:
-            self.show_panel()
+            self.show_panel(tab if tab in TABS else "home")
         return 0
 
     # ---- the VPN changing without us -------------------------------------------------
@@ -97,39 +130,90 @@ class App(Gtk.Application):
             self.refresh(status_only=True)
         return False
 
-    # ---- tray -----------------------------------------------------------------------
+    # ---- the menu in the top bar ----------------------------------------------------
     def build_indicator(self):
         icons = os.path.join(HERE, "icons")
         icon_dir = icons if os.path.isdir(icons) else ""
         self.indicator = AppIndicator.Indicator.new_with_path(
-            "vpntray", "vpntray-off", AppIndicator.IndicatorCategory.APPLICATION_STATUS,
-            icon_dir)
+            "vpntray", "vpntray-off", AppIndicator.IndicatorCategory.APPLICATION_STATUS, icon_dir)
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        name = self.vpn.name
         menu = Gtk.Menu()
-        self.mi_state = Gtk.MenuItem(label=f"{self.vpn.name}: ...")
-        self.mi_state.set_sensitive(False)
-        self.mi_open = Gtk.MenuItem(label="Open panel")
-        self.mi_open.connect("activate", lambda *_: self.show_panel())
-        self.mi_toggle = Gtk.MenuItem(label="Connect")
-        self.mi_toggle.connect("activate", lambda *_: self.toggle())
-        mi_quit = Gtk.MenuItem(label="Quit")
-        mi_quit.connect("activate", lambda *_: self.quit())
-        for mi in (self.mi_open, self.mi_state, self.mi_toggle, Gtk.SeparatorMenuItem(), mi_quit):
+
+        def item(label, handler=None, sensitive=True):
+            mi = Gtk.MenuItem(label=label)
+            mi.set_sensitive(sensitive)
+            if handler:
+                mi.connect("activate", handler)
             menu.append(mi)
+            return mi
+
+        self.mi_state = item("Status: ...", sensitive=False)
+        self.mi_loc = item("Location: ...", sensitive=False)
+        menu.append(Gtk.SeparatorMenuItem())
+        self.mi_connect = item("Connect", lambda *_: self.connect_to(self.state.get("city"), self.state.get("last")))
+        self.mi_disconnect = item("Disconnect", lambda *_: self.disconnect())
+        menu.append(Gtk.SeparatorMenuItem())
+        self.mi_connect_to = item("Connect to")
+        self.sub_connect = Gtk.Menu()
+        self.mi_connect_to.set_submenu(self.sub_connect)
+        self.fill_connect_menu()
+        menu.append(Gtk.SeparatorMenuItem())
+        item(f"Open {name}", lambda *_: self.show_panel("home"))
+        for tab in TABS[1:]:
+            item(TAB_TITLES[tab], lambda *_, t=tab: self.show_panel(t))
+        menu.append(Gtk.SeparatorMenuItem())
+        item(f"Quit {name}", lambda *_: self.quit())
         menu.show_all()
         self.indicator.set_menu(menu)
-        self.indicator.set_secondary_activate_target(self.mi_open)  # middle click
+        self.indicator.set_secondary_activate_target(self.mi_connect_to)
+
+    def loc_title(self, loc):
+        return f"{loc.country}, {loc.city}"
+
+    def fill_connect_menu(self):
+        """"Connect to >": the fastest locations with their flags, and "Other servers..." for the rest."""
+        for child in self.sub_connect.get_children():
+            self.sub_connect.remove(child)
+        fastest = Gtk.MenuItem(label="Fastest location")
+        fastest.connect("activate", lambda *_: self.connect_to(None, "Fastest location"))
+        self.sub_connect.append(fastest)
+        self.sub_connect.append(Gtk.SeparatorMenuItem())
+        for loc in [x for x in self.locations if x.ping >= 0][:MENU_LOCATIONS] or self.locations[:MENU_LOCATIONS]:
+            mi = Gtk.MenuItem(label=f"{loc.flag}  {self.loc_title(loc)}".strip())
+            mi.connect("activate", lambda *_, loc=loc: self.connect_to(loc.city, self.loc_title(loc)))
+            self.sub_connect.append(mi)
+        if self.locations:
+            self.sub_connect.append(Gtk.SeparatorMenuItem())
+        other = Gtk.MenuItem(label="Other servers...")
+        other.connect("activate", lambda *_: self.show_panel("home", focus_search=True))
+        self.sub_connect.append(other)
+        self.sub_connect.show_all()
+
+    def location_label(self):
+        """"Switzerland, Zurich": where it is connected, else where it connected last."""
+        if self.status and self.status.connected and self.status.location:
+            city = self.status.location.casefold()
+            for loc in self.locations:
+                if loc.city.casefold() == city:
+                    return self.loc_title(loc)
+            return self.status.location.title()
+        return self.state.get("last") or "Fastest location"
 
     def update_tray(self):
         on = bool(self.status and self.status.connected)
+        logged_in = bool(self.account is None or self.account.logged_in)
         self.indicator.set_icon_full("vpntray-on" if on else "vpntray-off",
                                      f"{self.vpn.name} on" if on else f"{self.vpn.name} off")
-        self.mi_state.set_label(f"{self.vpn.name}: connected" + (f" ({self.status.location})" if self.status.location else "")
-                                if on else f"{self.vpn.name}: disconnected")
-        self.mi_toggle.set_label("Disconnect" if on else "Connect")
-        self.mi_toggle.set_sensitive(not self.busy and bool(self.account is None or self.account.logged_in))
+        word = "Connecting..." if self.busy_what == "connect" else "Disconnecting..." if self.busy_what == "disconnect" \
+            else ("Connected" if on else "Disconnected")
+        self.mi_state.set_label(f"Status: {word}")
+        self.mi_loc.set_label(f"Location: {self.location_label()}")
+        self.mi_connect.set_sensitive(not on and not self.busy and logged_in)
+        self.mi_disconnect.set_sensitive(on and not self.busy)
+        self.mi_connect_to.set_sensitive(not self.busy and logged_in)
 
-    # ---- panel ----------------------------------------------------------------------
+    # ---- the panel (tabs) -----------------------------------------------------------
     def build_window(self):
         css = Gtk.CssProvider()
         css.load_from_data(CSS)
@@ -145,36 +229,46 @@ class App(Gtk.Application):
         w.set_default_size(WIDTH, -1)
         w.stick()
         w.connect("focus-out-event", self.on_focus_out)
-        w.connect("key-press-event", lambda _w, e: self.win.hide() if e.keyval == Gdk.KEY_Escape else None)
-        w.connect("delete-event", lambda *_: w.hide_on_delete())
+        w.connect("key-press-event", lambda _w, e: self.hide_panel() if e.keyval == Gdk.KEY_Escape else None)
+        w.connect("delete-event", lambda *_: (self.hide_panel(), True)[1])
 
         frame = Gtk.Frame()
         frame.set_shadow_type(Gtk.ShadowType.OUT)
         w.add(frame)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.set_border_width(12)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         frame.add(box)
+
+        self.nb = Gtk.Notebook()
+        self.nb.set_show_border(False)
+        self.nb.set_tab_pos(Gtk.PositionType.TOP)
+        builders = {"home": self.build_home, "exclusions": self.build_exclusions, "stats": self.build_stats,
+                    "support": self.build_support, "settings": self.build_settings}
+        for tab in TABS:
+            self.nb.append_page(builders[tab](), Gtk.Label(label=TAB_TITLES[tab]))
+        self.nb.connect("switch-page", self.on_tab)
+        box.pack_start(self.nb, True, True, 0)
 
         self.error = Gtk.Label(xalign=0)
         self.error.set_line_wrap(True)
-        self.error.set_max_width_chars(44)
+        self.error.set_max_width_chars(46)
+        self.error.set_margin_start(10)
+        self.error.set_margin_bottom(6)
         self.error.get_style_context().add_class("vt-error")
         self.error.set_no_show_all(True)
-
-        self.stack = Gtk.Stack()
-        self.stack.set_vhomogeneous(False)
-        self.stack.add_named(self.build_main(), "main")
-        self.stack.add_named(self.build_login(), "login")
-        box.pack_start(self.stack, True, True, 0)
         box.pack_start(self.error, False, False, 0)
         frame.show_all()
         self.error.hide()
 
+    # ---- Home ----
+    def build_home(self):
+        self.home_stack = Gtk.Stack()
+        self.home_stack.set_vhomogeneous(False)
+        self.home_stack.add_named(self.build_main(), "main")
+        self.home_stack.add_named(self.build_login(), "login")
+        return self.home_stack
+
     def build_main(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        brand = Gtk.Label(label=self.vpn.name, xalign=0)         # which VPN this panel is for
-        brand.get_style_context().add_class("vt-dim")
-        box.pack_start(brand, False, False, 0)
+        box = page_box()
         head = Gtk.Box(spacing=10)
         texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.lbl_status = Gtk.Label(label="Checking...", xalign=0)
@@ -193,7 +287,7 @@ class App(Gtk.Application):
         self.btn_fastest = Gtk.Button(label="Fastest location")
         self.btn_fastest.set_relief(Gtk.ReliefStyle.NONE)
         self.btn_fastest.get_child().set_xalign(0)
-        self.btn_fastest.connect("clicked", lambda *_: self.connect_to(None))
+        self.btn_fastest.connect("clicked", lambda *_: self.connect_to(None, "Fastest location"))
         box.pack_start(self.btn_fastest, False, False, 0)
 
         self.search = Gtk.SearchEntry()
@@ -217,26 +311,15 @@ class App(Gtk.Application):
             tv.append_column(col)
         tv.connect("row-activated", self.on_row)
         sw = Gtk.ScrolledWindow()
-        sw.set_min_content_height(230)
+        sw.set_min_content_height(240)
         sw.set_shadow_type(Gtk.ShadowType.IN)
         sw.add(tv)
         box.pack_start(sw, True, True, 0)
-
-        box.pack_start(Gtk.Separator(), False, False, 0)
-        acc = Gtk.Box(spacing=8)
-        self.lbl_acc = Gtk.Label(label="", xalign=0)
-        self.lbl_acc.get_style_context().add_class("vt-dim")
-        self.lbl_acc.set_ellipsize(3)
-        btn_out = Gtk.Button(label="Log out")
-        btn_out.connect("clicked", self.on_logout)
-        acc.pack_start(self.lbl_acc, True, True, 0)
-        acc.pack_end(btn_out, False, False, 0)
-        box.pack_start(acc, False, False, 0)
         self.main_widgets = [self.btn_fastest, self.search, tv]
         return box
 
     def build_login(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box = page_box()
         t = Gtk.Label(label=f"Log in to {self.vpn.name}", xalign=0)
         t.get_style_context().add_class("vt-status")
         self.in_email = Gtk.Entry(placeholder_text="Email")
@@ -251,16 +334,145 @@ class App(Gtk.Application):
             box.pack_start(wdg, False, False, 0)
         return box
 
+    # ---- Exclusions ----
+    def build_exclusions(self):
+        box = page_box()
+        box.pack_start(dim("Sites that skip the VPN (General), or the only sites that use it (Selective)."), False, False, 0)
+        row = Gtk.Box(spacing=8)
+        row.pack_start(Gtk.Label(label="Mode", xalign=0), False, False, 0)
+        self.cb_excl_mode = Gtk.ComboBoxText()
+        self.cb_excl_mode.append("general", "General: everything except these sites")
+        self.cb_excl_mode.append("selective", "Selective: only these sites")
+        self.cb_excl_mode.connect("changed", self.on_excl_mode)
+        row.pack_start(self.cb_excl_mode, True, True, 0)
+        box.pack_start(row, False, False, 0)
+
+        self.excl_store = Gtk.ListStore(str)
+        tv = self.excl_tree = Gtk.TreeView(model=self.excl_store)
+        tv.set_headers_visible(False)
+        tv.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        tv.append_column(Gtk.TreeViewColumn("", Gtk.CellRendererText(), text=0))
+        sw = Gtk.ScrolledWindow()
+        sw.set_min_content_height(190)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        sw.add(tv)
+        box.pack_start(sw, True, True, 0)
+
+        add = Gtk.Box(spacing=6)
+        self.in_excl = Gtk.Entry(placeholder_text="example.com, *.example.com or an IP address")
+        self.in_excl.connect("activate", self.on_excl_add)
+        btn_add = Gtk.Button(label="Add")
+        btn_add.connect("clicked", self.on_excl_add)
+        add.pack_start(self.in_excl, True, True, 0)
+        add.pack_end(btn_add, False, False, 0)
+        box.pack_start(add, False, False, 0)
+        acts = Gtk.Box(spacing=6)
+        btn_rm = Gtk.Button(label="Remove selected")
+        btn_rm.connect("clicked", self.on_excl_remove)
+        btn_clear = Gtk.Button(label="Clear all")
+        btn_clear.connect("clicked", self.on_excl_clear)
+        acts.pack_start(btn_rm, False, False, 0)
+        acts.pack_start(btn_clear, False, False, 0)
+        box.pack_start(acts, False, False, 0)
+        return box
+
+    # ---- Stats ----
+    def build_stats(self):
+        box = page_box()
+        grid = Gtk.Grid(column_spacing=16, row_spacing=8)
+        self.stat_labels = {}
+        for i, (key, title) in enumerate((("status", "Status"), ("location", "Location"), ("time", "Connected for"),
+                                          ("down", "Downloaded"), ("up", "Uploaded"))):
+            grid.attach(Gtk.Label(label=title, xalign=0), 0, i, 1, 1)
+            lbl = Gtk.Label(label="-", xalign=0)
+            lbl.get_style_context().add_class("vt-head")
+            grid.attach(lbl, 1, i, 1, 1)
+            self.stat_labels[key] = lbl
+        box.pack_start(grid, False, False, 0)
+        box.pack_start(dim("Traffic through the VPN tunnel since it was connected, as counted by the system."), False, False, 0)
+        return box
+
+    # ---- Support ----
+    def build_support(self):
+        box = page_box()
+        self.lbl_version = Gtk.Label(label="", xalign=0)
+        self.lbl_version.get_style_context().add_class("vt-head")
+        box.pack_start(self.lbl_version, False, False, 0)
+        box.pack_start(dim("An unofficial panel for the AdGuard VPN command-line tool; not affiliated with AdGuard."), False, False, 0)
+        for label, handler in (("Open the support page", lambda *_: self.open_url(SUPPORT_URL)),
+                               ("Export logs to Downloads", self.on_export_logs),
+                               ("Check for updates", self.on_check_update)):
+            b = Gtk.Button(label=label)
+            b.set_halign(Gtk.Align.START)
+            b.connect("clicked", handler)
+            box.pack_start(b, False, False, 0)
+        self.lbl_support = dim("")
+        box.pack_start(self.lbl_support, False, False, 0)
+        return box
+
+    # ---- Settings ----
+    def build_settings(self):
+        box = page_box()
+        acc = Gtk.Box(spacing=8)
+        self.lbl_acc = Gtk.Label(label="", xalign=0)
+        self.lbl_acc.set_line_wrap(True)
+        self.lbl_acc.set_max_width_chars(34)
+        btn_out = Gtk.Button(label="Log out")
+        btn_out.connect("clicked", self.on_logout)
+        acc.pack_start(self.lbl_acc, True, True, 0)
+        acc.pack_end(btn_out, False, False, 0)
+        box.pack_start(acc, False, False, 0)
+        box.pack_start(Gtk.Separator(), False, False, 2)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=8)
+        self.cb_mode = Gtk.ComboBoxText()
+        self.cb_mode.append("tun", "TUN (all traffic)")
+        self.cb_mode.append("socks", "SOCKS5 proxy")
+        self.cb_protocol = Gtk.ComboBoxText()
+        for key, label in (("auto", "Automatic"), ("http2", "HTTP/2"), ("quic", "QUIC (HTTP/3)")):
+            self.cb_protocol.append(key, label)
+        for i, (title, wdg) in enumerate((("Mode", self.cb_mode), ("Protocol", self.cb_protocol))):
+            grid.attach(Gtk.Label(label=title, xalign=0), 0, i, 1, 1)
+            wdg.set_hexpand(True)
+            grid.attach(wdg, 1, i, 1, 1)
+        self.cb_mode.connect("changed", lambda w: self.on_setting("mode", w.get_active_id()))
+        self.cb_protocol.connect("changed", lambda w: self.on_setting("protocol", w.get_active_id()))
+        self.in_dns = Gtk.Entry(placeholder_text="default, or e.g. 9.9.9.9")
+        self.in_dns.connect("activate", lambda w: self.on_setting("dns", w.get_text().strip() or "default"))
+        grid.attach(Gtk.Label(label="DNS", xalign=0), 0, 2, 1, 1)
+        self.in_dns.set_hexpand(True)
+        grid.attach(self.in_dns, 1, 2, 1, 1)
+        box.pack_start(grid, False, False, 0)
+
+        self.sw_settings = {}
+        for key, title in (("post_quantum", "Post-quantum encryption"),
+                           ("change_system_dns", "Change the system's DNS while connected"),
+                           ("notifications", "Notify about the connection")):
+            row = Gtk.Box(spacing=8)
+            row.pack_start(Gtk.Label(label=title, xalign=0), True, True, 0)
+            sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+            sw.connect("state-set", lambda w, state, k=key: self.on_switch_setting(k, state))
+            row.pack_end(sw, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            self.sw_settings[key] = sw
+        box.pack_start(dim("Mode, protocol and DNS apply the next time you connect."), False, False, 0)
+        return box
+
+    # ---- showing and hiding ----
     def row_visible(self, model, it, _data):
         q = self.search.get_text().strip().lower()
         return not q or all(p in model[it][4] for p in q.split())
 
     def on_focus_out(self, *_):
         if time.monotonic() - self.shown_at > 0.4:  # ignore the focus flicker while mapping
-            self.win.hide()
+            self.hide_panel()
         return False
 
-    def show_panel(self):
+    def hide_panel(self):
+        self.win.hide()
+        self.stop_stats()
+
+    def show_panel(self, tab="home", focus_search=False):
         self.shown_at = time.monotonic()
         self.search.set_text("")
         self.set_error("")
@@ -272,24 +484,47 @@ class App(Gtk.Application):
         self.win.move(x, wa.y + 4)
         self.win.show()
         self.win.present()
+        index = TABS.index(tab)
+        if self.nb.get_current_page() == index:
+            self.on_tab(self.nb, None, index)
+        self.nb.set_current_page(index)
+        if focus_search:
+            self.search.grab_focus()
         self.refresh()
+
+    def on_tab(self, _nb, _page, num):
+        tab = TABS[num]
+        self.on_stats = tab == "stats"
+        if tab == "exclusions":
+            self.load_exclusions()
+        elif tab == "stats":
+            self.start_stats()
+        elif tab == "support":
+            self.lbl_version.set_text("...")
+            bg(self.vpn.version, lambda v: self.lbl_version.set_text(v if isinstance(v, str) else ""))
+        elif tab == "settings":
+            self.load_settings()
+        if tab != "stats":
+            self.stop_stats()
 
     def set_error(self, msg):
         self.error.set_text(msg)
         self.error.set_visible(bool(msg))
 
-    # ---- state -> UI ----------------------------------------------------------------
+    # ---- rendering the state ----
+    busy_what = ""                                # "connect" / "disconnect" while one is running
+
     def render(self):
         on = bool(self.status and self.status.connected)
-        logged_in = self.account is None or self.account.logged_in
-        self.stack.set_visible_child_name("main" if logged_in else "login")
+        logged_in = bool(self.account is None or self.account.logged_in)
+        self.home_stack.set_visible_child_name("main" if logged_in else "login")
         if self.busy:
             pass
         elif self.status is None:
             self.lbl_status.set_text("Checking...")
         else:
             self.lbl_status.set_text("Connected" if on else "Disconnected")
-            self.lbl_loc.set_text(self.status.location if on else "Not connected")
+            self.lbl_loc.set_text(self.location_label())
         self.switch.handler_block_by_func(self.on_switch)
         self.switch.set_active(on)
         self.switch.set_state(on)
@@ -298,8 +533,17 @@ class App(Gtk.Application):
             wdg.set_sensitive(not self.busy)
         if self.account and self.account.logged_in:
             plan = f"  ({self.account.plan})" if self.account.plan else ""
-            self.lbl_acc.set_text(self.account.email + plan)
+            until = f"\nValid until {self.account.valid_until}" if self.account.valid_until else ""
+            self.lbl_acc.set_text(f"{self.account.email}{plan}{until}")
+        elif self.account is not None:
+            self.lbl_acc.set_text("Not logged in")
+        if on and not self.connected_at:
+            self.connected_at = time.monotonic()
+        elif not on:
+            self.connected_at = None
         self.update_tray()
+        if self.stats_timer:
+            self.tick_stats()
 
     def refresh(self, status_only=False):
         def work():
@@ -323,23 +567,25 @@ class App(Gtk.Application):
                 self.locations = locs
                 self.loc_time = time.monotonic()
                 self.fill_locations()
+                self.fill_connect_menu()
             self.render()
 
         bg(work, done)
 
     def fill_locations(self):
         self.store.clear()
-        for l in self.locations:
-            ping = f"{l.ping} ms" if l.ping >= 0 else ""
-            self.store.append([f"{l.flag} {l.country}".strip(), l.city, ping, l.ping,
-                               f"{l.iso} {l.country} {l.city}".lower()])
+        for loc in self.locations:
+            ping = f"{loc.ping} ms" if loc.ping >= 0 else ""
+            self.store.append([f"{loc.flag} {loc.country}".strip(), loc.city, ping, loc.ping,
+                               f"{loc.iso} {loc.country} {loc.city}".lower()])
 
     # ---- actions --------------------------------------------------------------------
-    def act(self, label, fn, expect):
+    def act(self, what, label, fn, expect):
         """Run a CLI action in the background, show progress, then re-check the status."""
         if self.busy:
             return
         self.busy = True
+        self.busy_what = what
         self.set_error("")
         self.lbl_status.set_text(label)
         self.lbl_loc.set_text("")
@@ -363,19 +609,27 @@ class App(Gtk.Application):
                 GLib.timeout_add(1000, lambda: (self.settle(expect, tries - 1), False)[1])
                 return
             self.busy = False
+            self.busy_what = ""
             self.render()
             if self.account is None or not self.account.logged_in:
                 self.refresh()
         bg(self.vpn.status, done)
 
-    def connect_to(self, city):
-        self.act("Connecting...", lambda: self.vpn.connect(city), True)
+    def connect_to(self, city, title=None):
+        if title:
+            self.state["last"] = title
+            self.state["city"] = city
+            core.save_state(self.state)
+        self.act("connect", "Connecting...", lambda: self.vpn.connect(city), True)
+
+    def disconnect(self):
+        self.act("disconnect", "Disconnecting...", self.vpn.disconnect, False)
 
     def toggle(self):
         if self.status and self.status.connected:
-            self.act("Disconnecting...", self.vpn.disconnect, False)
+            self.disconnect()
         else:
-            self.connect_to(None)
+            self.connect_to(self.state.get("city"), self.state.get("last"))
 
     def on_switch(self, _sw, state):
         if state != bool(self.status and self.status.connected):
@@ -383,8 +637,8 @@ class App(Gtk.Application):
         return True  # render() sets the real state
 
     def on_row(self, tree, path, _col):
-        city = tree.get_model()[path][1]
-        self.connect_to(city)
+        row = tree.get_model()[path]
+        self.connect_to(row[1], f"{row[0].split(' ', 1)[-1]}, {row[1]}")
 
     def on_login(self, *_):
         email, pw = self.in_email.get_text().strip(), self.in_pass.get_text()
@@ -412,8 +666,138 @@ class App(Gtk.Application):
             self.account = None
             self.locations = []
             self.store.clear()
+            self.fill_connect_menu()
             self.refresh()
         bg(self.vpn.logout, done)
+
+    # ---- exclusions ----
+    def load_exclusions(self):
+        def done(res):
+            if isinstance(res, Exception):
+                self.set_error(str(res))
+                return
+            self.excl_mode, self.excl_items = res
+            self.loading = True
+            self.cb_excl_mode.set_active_id(self.excl_mode if self.excl_mode in ("general", "selective") else "general")
+            self.excl_store.clear()
+            for entry in self.excl_items:
+                self.excl_store.append([entry])
+            self.loading = False
+        bg(self.vpn.exclusions, done)
+
+    def after_excl(self, res):
+        if isinstance(res, Exception) or not res.ok:
+            self.set_error(str(res) if isinstance(res, Exception) else (res.message or "The command failed"))
+        else:
+            self.set_error("")
+        self.load_exclusions()
+
+    def on_excl_mode(self, cb):
+        if self.loading or not cb.get_active_id() or cb.get_active_id() == self.excl_mode:
+            return
+        mode = cb.get_active_id()
+        bg(lambda: self.vpn.set_exclusion_mode(mode), self.after_excl)
+
+    def on_excl_add(self, *_):
+        items = self.in_excl.get_text().replace(",", " ").split()
+        if not items:
+            return
+        self.in_excl.set_text("")
+        bg(lambda: self.vpn.add_exclusions(items), self.after_excl)
+
+    def on_excl_remove(self, *_):
+        model, paths = self.excl_tree.get_selection().get_selected_rows()
+        items = [model[p][0] for p in paths]
+        if items:
+            bg(lambda: self.vpn.remove_exclusions(items), self.after_excl)
+
+    def on_excl_clear(self, *_):
+        bg(self.vpn.clear_exclusions, self.after_excl)
+
+    # ---- stats ----
+    def start_stats(self):
+        if not self.stats_timer:
+            self.stats_timer = GLib.timeout_add_seconds(2, self.tick_stats)
+        self.tick_stats()
+
+    def stop_stats(self):
+        if self.stats_timer:
+            GLib.source_remove(self.stats_timer)
+            self.stats_timer = 0
+
+    def tick_stats(self):
+        if not self.win.get_visible() or not self.on_stats:
+            self.stats_timer = 0
+            return False
+        on = bool(self.status and self.status.connected)
+        traffic = core.tun_traffic() if on else None
+        up = core.service_uptime() if on else None
+        if on and up is None and self.connected_at:
+            up = time.monotonic() - self.connected_at
+        self.stat_labels["status"].set_text("Connected" if on else "Disconnected")
+        self.stat_labels["location"].set_text(self.location_label())
+        self.stat_labels["time"].set_text(core.human_duration(up) if up is not None else "-")
+        self.stat_labels["down"].set_text(core.human_bytes(traffic[0]) if traffic else "-")
+        self.stat_labels["up"].set_text(core.human_bytes(traffic[1]) if traffic else "-")
+        return True
+
+    # ---- support ----
+    def open_url(self, url):
+        Gtk.show_uri_on_window(None, url, Gdk.CURRENT_TIME)
+
+    def on_export_logs(self, *_):
+        folder = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or os.path.expanduser("~")
+        self.lbl_support.set_text("Exporting...")
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.lbl_support.set_text(str(res))
+            else:
+                self.lbl_support.set_text(res.message if res.ok else (res.message or "Export failed"))
+        bg(lambda: self.vpn.export_logs(folder), done)
+
+    def on_check_update(self, *_):
+        self.lbl_support.set_text("Checking...")
+
+        def done(res):
+            if isinstance(res, Exception):
+                self.lbl_support.set_text(str(res))
+            else:
+                self.lbl_support.set_text(res.message or "Done")
+        bg(self.vpn.check_update, done)
+
+    # ---- settings ----
+    def load_settings(self):
+        def done(cfg):
+            if isinstance(cfg, Exception):
+                self.set_error(str(cfg))
+                return
+            self.config = cfg
+            self.loading = True
+            self.cb_mode.set_active_id(cfg.mode)
+            self.cb_protocol.set_active_id(cfg.protocol)
+            self.in_dns.set_text("" if cfg.dns == "default" else cfg.dns)
+            for key, sw in self.sw_settings.items():
+                sw.set_active(getattr(cfg, key))
+                sw.set_state(getattr(cfg, key))
+            self.loading = False
+        bg(self.vpn.config, done)
+
+    def on_setting(self, key, value):
+        if self.loading or value is None or (self.config and getattr(self.config, key, None) == value):
+            return
+
+        def done(res):
+            if isinstance(res, Exception) or not res.ok:
+                self.set_error(str(res) if isinstance(res, Exception) else (res.message or "The setting was not changed"))
+            else:
+                self.set_error("")
+            self.load_settings()
+        bg(lambda: self.vpn.set_config(key, value), done)
+
+    def on_switch_setting(self, key, state):
+        self.on_setting(key, bool(state))
+        return False
 
 
 def set_process_name(name):

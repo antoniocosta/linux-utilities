@@ -38,5 +38,8 @@ check "file named after the entry" grep -q '^Exec=/x/example$' "$HOME/.config/au
 
 t_begin "vpntray: parsers and the provider adapter (against a fake CLI)"
 check "unit tests pass" python3 "$ROOT/vpntray/test_vpntray.py"
+if command -v Xvfb >/dev/null && command -v dbus-run-session >/dev/null && python3 -c 'import gi; gi.require_version("AyatanaAppIndicator3","0.1")' 2>/dev/null; then
+    eq "every tab opens without errors (private display, fake CLI)" "$("$ROOT/vpntray/smoke-test.sh" 2>/dev/null | grep '^RESULT:')" "RESULT: ok"
+fi
 
 t_summary

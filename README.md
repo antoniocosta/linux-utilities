@@ -42,23 +42,57 @@ Xfce's Generic Monitor plugin, so there's no extra process between measurements.
 
 ## vpntray
 
-A top-bar shield (outline: off, filled: on) with a compact panel like the macOS VPN menu-bar
-apps: a connect switch with the status and location, a "Fastest location" row, a searchable list
-of locations (flag, city, ping), your account with Log out, and a login form when logged out.
-Errors show inline; the panel hides when it loses focus. Click the shield and choose
-*Open panel* (or middle-click it; running `vpntray` also opens it).
+A top-bar mask (green when connected, dimmed when not) whose menu is laid out like the macOS
+AdGuard VPN app's:
+
+```
+Status: Disconnected
+Location: Switzerland, Zurich
+-----
+Connect
+Disconnect
+-----
+Connect to >   (the fastest locations with their flags, and "Other servers..." at the bottom)
+-----
+Open AdGuard VPN
+Exclusions
+Stats
+Support
+Settings
+-----
+Quit AdGuard VPN
+```
+
+and a compact panel with the same tabs:
+
+- **Home**: the connect switch with the status and location, a "Fastest location" row, and a
+  searchable list of every location (flag, city, ping); a login form when logged out.
+- **Exclusions**: General or Selective mode, and the sites (`example.com`, `*.example.com`, an IP
+  address) to add or remove.
+- **Stats**: connected time and the traffic through the tunnel (downloaded, uploaded), refreshed
+  every 2 seconds while the tab is showing.
+- **Support**: the tool's version, the support page, *Export logs* (to Downloads) and *Check for
+  updates*.
+- **Settings**: your account (with Log out), the mode (TUN or SOCKS5), the protocol (Automatic,
+  HTTP/2, QUIC), the DNS upstream, post-quantum encryption, changing the system's DNS, and
+  connection notifications. These are the tool's own `config` settings.
+
+Errors show inline; the panel hides when it loses focus. Choose any of the menu entries (or
+middle-click the mask for *Connect to*); running `vpntray` also opens the panel, and
+`vpntray --tab=exclusions` opens a given tab. The mask is a generic mask drawn for this project,
+not AdGuard's logo.
 
 It drives the AdGuard VPN command-line tool (`adguardvpn-cli`, installed separately) and is
 **unofficial and not affiliated with AdGuard**. Python 3 + GTK3, about 30 MB, 0% CPU when idle:
-no timers; the top-bar shield is AdGuard green with a check when connected and a dimmed outline when
-not; the status is read at start, when the panel opens, after each action, and whenever the
-network changes (it listens to `ip monitor`, so the shield also follows a VPN connected or dropped from
-the command line or by a reconnect). Your
+no timers; the status is read at start, when the panel opens, after each action, and whenever the
+network changes (it listens to `ip monitor`, so the mask also follows a VPN connected or dropped
+from the command line or by a reconnect). Your
 password goes only to the tool's standard input; nothing is stored. Connecting in TUN mode needs
 root, so vpntray points `SUDO_ASKPASS` at a small password dialog (zenity). No sudoers rule.
 
 `./vpntray/install.sh`. Tests, without a VPN or display (a fake command-line tool):
-`python3 vpntray/test_vpntray.py`.
+`python3 vpntray/test_vpntray.py`; `vpntray/smoke-test.sh` opens every tab on a private invisible
+display and fails on any error.
 
 ---
 

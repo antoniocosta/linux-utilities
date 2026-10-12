@@ -14,4 +14,4 @@ install -m 644 "$HERE"/icons/*.svg "$BIN/icons/"
 install -m 644 "$HERE"/icons/*.svg "$HOME/.local/share/icons/hicolor/scalable/status/"
 autostart_entry "vpntray" "$BIN/vpntray --background"
 restart_bg vpntray "$BIN/vpntray" --background
-ok "vpntray in the top bar (click the shield, then Open panel; or run: vpntray)"
+ok "vpntray in the top bar (click the mask for the menu; or run: vpntray)"

@@ -30,5 +30,34 @@ login)
     [[ -n "$pass" && "$pass" != wrong ]] || { echo "Error: invalid credentials" >&2; exit 1; }
     echo "$email" > "$D/user"; echo "Successfully Logged in" ;;
 logout) rm -f "$D/user" "$D/connected"; echo "Successfully Logged out" ;;
+site-exclusions)
+    shift; sub="${1:-}"; shift || true
+    mode=$(cat "$D/exmode" 2>/dev/null || echo general)
+    case "$sub" in
+    show) echo "Exclusions for ${mode^^} mode:"; [[ -f "$D/exclusions" ]] && sort "$D/exclusions"; echo ;;
+    add) for x in "$@"; do echo "$x" >> "$D/exclusions"; done; echo "Successfully added $# exclusions" ;;
+    remove) for x in "$@"; do grep -vxF -- "$x" "$D/exclusions" > "$D/exclusions.new" 2>/dev/null; mv "$D/exclusions.new" "$D/exclusions"; done
+            echo "Successfully removed $# exclusions" ;;
+    clear) rm -f "$D/exclusions"; echo "Successfully cleared exclusions" ;;
+    mode) if [[ -n "${1:-}" ]]; then echo "$1" > "$D/exmode"; echo "Exclusion mode set to ${1^^}"; else echo "Current exclusion mode is ${mode^^}"; fi ;;
+    esac ;;
+config)
+    shift; sub="${1:-}"; shift || true
+    case "$sub" in
+    show)
+        g() { cat "$D/cfg-$1" 2>/dev/null || echo "$2"; }
+        echo "Current configuration:"
+        printf '\tMode: %s\n' "$(g mode tun)"
+        printf '\tDNS upstream: %s\n' "$(g dns 'Default (provided by AdGuard VPN)')"
+        printf '\tChange system DNS: %s\n' "$(g change-system-dns off)"
+        printf '\tProtocol: %s\n' "$(g protocol 'Default (auto)')"
+        printf '\tPost-quantum cryptography: %s\n' "$(g post-quantum 'Default (on)')"
+        printf '\tShow notifications: %s\n' "$(g show-notifications 'Default (off)')" ;;
+    set-*) echo "$1" > "$D/cfg-${sub#set-}"; echo "Successfully set ${sub#set-}" ;;
+    esac ;;
+--version) echo "AdGuard VPN CLI v9.9.9" ;;
+export-logs) shift; out="."; while (( $# )); do [[ $1 == -o ]] && { out="$2"; shift; }; shift; done
+    echo logs > "$out/adguard_vpn_logs.zip"; echo "Logs exported to $out/adguard_vpn_logs.zip" ;;
+check-update) echo "You are using the latest version" ;;
 *) echo "unknown command" >&2; exit 2 ;;
 esac

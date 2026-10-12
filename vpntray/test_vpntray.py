@@ -133,6 +133,85 @@ class Adapter(unittest.TestCase):
         self.assertIn("SUDO_ASKPASS=/x/askpass", v.run([]).out)
 
 
+REAL_CONFIG = """Current configuration:
+\tData directory: /home/user/.local/share/adguardvpn-cli
+\tMode: tun
+\tSOCKS port: 1080
+\tDNS upstream: Default (provided by AdGuard VPN)
+\tTunnel routing mode: auto
+\tChange system DNS: off
+\tProtocol: Default (auto)
+\tPost-quantum cryptography: Default (on)
+\tShow notifications: Default (off)
+"""
+
+
+class TestSettingsAndExclusions(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        os.environ["FAKE_VPN_DIR"] = self.dir
+        self.v = core.AdGuard(os.path.join(HERE, "fake-adguardvpn-cli"))
+
+    def test_parse_exclusions(self):
+        self.assertEqual(core.parse_exclusions("Exclusions for GENERAL mode:\n\n"), ("general", []))
+        self.assertEqual(core.parse_exclusions("Exclusions for SELECTIVE mode:\n*.a.com\nb.com\n"),
+                         ("selective", ["*.a.com", "b.com"]))
+        self.assertEqual(core.parse_exclusions("Exclusions for GENERAL mode:\n- x.com\n* y.com\n")[1], ["x.com", "y.com"])
+
+    def test_exclusions_round_trip(self):
+        self.assertEqual(self.v.exclusions(), ("general", []))
+        self.assertTrue(self.v.add_exclusions(["a.com", "*.b.com"]).ok)
+        self.assertEqual(sorted(self.v.exclusions()[1]), ["*.b.com", "a.com"])
+        self.v.remove_exclusions(["a.com"])
+        self.assertEqual(self.v.exclusions()[1], ["*.b.com"])
+        self.v.set_exclusion_mode("selective")
+        self.assertEqual(self.v.exclusions()[0], "selective")
+        self.v.clear_exclusions()
+        self.assertEqual(self.v.exclusions()[1], [])
+
+    def test_parse_config_real_output(self):
+        c = core.parse_config(REAL_CONFIG)
+        self.assertEqual((c.mode, c.protocol, c.dns), ("tun", "auto", "default"))
+        self.assertTrue(c.post_quantum)
+        self.assertFalse(c.notifications)
+        self.assertFalse(c.change_system_dns)
+
+    def test_parse_config_values(self):
+        c = core.parse_config("\tMode: socks\n\tDNS upstream: 9.9.9.9\n\tProtocol: QUIC\n"
+                              "\tPost-quantum cryptography: off\n\tShow notifications: on\n")
+        self.assertEqual((c.mode, c.protocol, c.dns), ("socks", "quic", "9.9.9.9"))
+        self.assertFalse(c.post_quantum)
+        self.assertTrue(c.notifications)
+
+    def test_set_config(self):
+        self.assertTrue(self.v.set_config("protocol", "quic").ok)
+        self.assertTrue(self.v.set_config("post_quantum", False).ok)
+        c = self.v.config()
+        self.assertEqual(c.protocol, "quic")
+        self.assertFalse(c.post_quantum)
+        self.v.set_config("notifications", True)
+        self.assertTrue(self.v.config().notifications)
+
+    def test_support(self):
+        self.assertIn("9.9.9", self.v.version())
+        r = self.v.export_logs(self.dir)
+        self.assertTrue(r.ok)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "adguard_vpn_logs.zip")))
+        self.assertIn("latest", self.v.check_update().out)
+
+    def test_traffic_and_units(self):
+        base = tempfile.mkdtemp()
+        os.makedirs(f"{base}/tun0/statistics")
+        open(f"{base}/tun0/statistics/rx_bytes", "w").write("1048576\n")
+        open(f"{base}/tun0/statistics/tx_bytes", "w").write("2048\n")
+        self.assertEqual(core.tun_traffic("tun0", base), (1048576, 2048))
+        self.assertIsNone(core.tun_traffic("tun9", base))
+        self.assertEqual(core.human_bytes(512), "512 B")
+        self.assertEqual(core.human_bytes(1048576), "1.0 MB")
+        self.assertEqual(core.human_duration(75), "1 min 15 s")
+        self.assertEqual(core.human_duration(7500), "2 h 05 min")
+
+
 class TestLinkWatch(unittest.TestCase):
     def test_lines_arrive_as_they_happen(self):
         import select
